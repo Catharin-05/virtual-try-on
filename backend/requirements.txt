@@ -1,0 +1,11 @@
+rfdetr 
+supervision 
+opencv-python 
+numpy
+torch 
+torchvision 
+huggingface_hub 
+ultralytics
+git+https://github.com/ibaiGorordo/Sapiens-Pytorch-Inference.git 
+mhr 
+pymomentum-cpu

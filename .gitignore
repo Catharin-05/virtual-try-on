@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+backend/assets
+backend/models
+backend/output_onnx
+backend/Ref_3D_exp
+backend/pipeline_output
+backend/video
+yolov8n.onnx
+backend/sapiens_seg_final.onnx
+backend/sapiens_seg_final.onnx.data
+backend/sapiens_1b_goliath_seg.onnx
+node_modules
+assets.zip
