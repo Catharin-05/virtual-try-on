@@ -98,9 +98,10 @@ def pick_best_view(targets, seg_results, label_options):
 
 
 def run_pipeline(video_path, out_dir="pipeline_output", num_frames=10,
-                  segment_all_frames=False, yolo_weights="yolov8n.pt",
-                  user_height_cm=None, build_3d_model_flag=False, sam3d_body_repo=None,
-                  calibrate_mesh_flag=False, mhr_assets=None):
+                 segment_all_frames=False, yolo_weights="yolov8n.pt",
+                 user_height_cm=None, build_3d_model_flag=False, sam3d_body_repo=None,
+                 calibrate_mesh_flag=False, mhr_assets=None,
+                 input_3d_obj=None, input_identity=None): # <--- Added arguments
     os.makedirs(out_dir, exist_ok=True)
     orientation_dir = os.path.join(out_dir, "orientation_frames")
     seg_dir = os.path.join(out_dir, "segmentation")
@@ -179,7 +180,26 @@ def run_pipeline(video_path, out_dir="pipeline_output", num_frames=10,
 
     # ---- Stage 4 (optional): 3D model reconstruction (Meta SAM 3D Body / MHR) ----
     body_3d_result = None
-    if build_3d_model_flag:
+    
+    if input_3d_obj and os.path.exists(input_3d_obj):
+        print(f"\n=== 3D model reconstruction (Bypassed: Using pre-generated {input_3d_obj}) ===")
+        import shutil
+        import numpy as np
+        
+        # Copy your pre-generated OBJ into the output directory for consistency
+        dest_obj = os.path.join(out_dir, "sam3d_body.obj")
+        if os.path.abspath(input_3d_obj) != os.path.abspath(dest_obj):
+            shutil.copy2(input_3d_obj, dest_obj)
+            
+        # If you saved the numpy latent vector, load it so MHR can use it. Otherwise, None.
+        fused_id = np.load(input_identity) if (input_identity and os.path.exists(input_identity)) else None
+             
+        body_3d_result = {
+             "obj_path": dest_obj,
+             "fused_identity": fused_id
+        }
+        
+    elif build_3d_model_flag:
         print("\n=== 3D model reconstruction (optional -- SAM 3D Body) ===")
         if not sam3d_body_repo:
             print("Skipped: --sam3d-body-repo <path to your local sam-3d-body clone> is required.")
@@ -298,8 +318,13 @@ if __name__ == "__main__":
                          help="Path to the unzipped MHR asset folder (compact_v6_1.model, lod*.fbx, "
                               "corrective_*.npz) from https://github.com/facebookresearch/MHR "
                               "(required if --calibrate-mesh is set).")
+    parser.add_argument("--input-3d-obj", default=None,
+                        help="Path to a pre-generated .obj file to bypass SAM 3D generation.")
+    parser.add_argument("--input-identity", default=None,
+                        help="Optional: Path to the .npy file containing 'fused_identity' parameters if you saved them.")
     args = parser.parse_args()
 
     run_pipeline(args.video, args.out, args.frames, args.all_frames, args.yolo_weights,
                  args.height, args.build_3d_model, args.sam3d_body_repo,
-                 args.calibrate_mesh, args.mhr_assets)
+                 args.calibrate_mesh, args.mhr_assets,
+                 args.input_3d_obj, args.input_identity) # <--- Passed arguments

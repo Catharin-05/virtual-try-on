@@ -1,0 +1,47 @@
+:root {
+  --bg: #0a0c12;
+  --panel: #10131c;
+  --panel-border: #1f2433;
+  --cyan: #5ee6ec;
+  --violet: #9b7bff;
+  --text: #eef1f7;
+  --text-dim: #7a8296;
+  --good: #4ade80;
+  --warn: #f0a860;
+  --error: #f0616b;
+
+  --font-display: 'Space Grotesk', 'Inter', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'IBM Plex Mono', 'JetBrains Mono', monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+}
+
+body {
+  background:
+    radial-gradient(ellipse 900px 500px at 20% -10%, rgba(94, 230, 236, 0.07), transparent 60%),
+    radial-gradient(ellipse 900px 600px at 100% 10%, rgba(155, 123, 255, 0.08), transparent 60%),
+    var(--bg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+}
+
+button:focus-visible,
+input:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+::selection { background: rgba(94, 230, 236, 0.25); }
