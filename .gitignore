@@ -229,3 +229,7 @@ backend/sapiens_seg_final.onnx.data
 backend/sapiens_1b_goliath_seg.onnx
 node_modules
 assets.zip
+backend/jobs
+backend/sapiens_outputs
+backend/sapiens_outputs_bench
+backend/timings
