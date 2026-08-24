@@ -4,13 +4,19 @@ Turn a single smartphone video of a person turning around into (1) real
 anthropometric body measurements in centimeters and (2) a 3D avatar mesh
 sized to match them — with a live web UI to try it end to end.
 
+## Demo
+
+### Upload
+
 <p align="center">
-  <img src="docs/screenshots/upload-screen.png" width="30%" alt="Upload screen" />
-  <img src="docs/screenshots/3d-viewer.png" width="30%" alt="3D model viewer with measurements panel" />
+  <img src="docs/screenshots/upload-screen.png" width="80%" alt="Upload screen" />
 </p>
 
+### 3D Result
 
-
+<p align="center">
+  <img src="docs/screenshots/3d-viewer.png" width="80%" alt="3D model viewer with measurements panel" />
+</p>
 ---
 
 ## Table of contents
