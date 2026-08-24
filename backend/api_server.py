@@ -11,10 +11,27 @@ Run:
     uvicorn api_server:app --reload --port 8000
 
 Config (env vars):
-    MHR_ASSETS_PATH   -- path to the unzipped MHR asset folder (default: ./assets)
-    JOBS_DIR          -- where per-job video/output folders are stored (default: ./jobs)
-    FRONTEND_ORIGIN   -- allowed CORS origin for the frontend dev server
-                         (default: http://localhost:5173, Vite's default port)
+    MHR_ASSETS_PATH      -- path to the unzipped MHR asset folder (default: ./assets)
+    JOBS_DIR             -- where per-job video/output folders are stored (default: ./jobs)
+    FRONTEND_ORIGIN      -- allowed CORS origin for the frontend dev server
+                            (default: http://localhost:5173, Vite's default port)
+    INPUT_3D_OBJ_PATH    -- pre-generated OBJ used as the calibration starting point,
+                            bypassing SAM 3D Body entirely (default: ./Ref_3D_exp/sam3d_body.obj)
+    INPUT_IDENTITY_PATH  -- matching .npy identity vector for the above (default:
+                            ./Ref_3D_exp/fused_identity.npy)
+
+    Both *_PATH defaults are relative to wherever you LAUNCH `uvicorn` from
+    (same convention as MHR_ASSETS_PATH) -- run it from your backend/
+    directory so `./Ref_3D_exp/...` actually resolves. If the files aren't
+    found, main.py's bypass silently no-ops and falls through to a neutral
+    starting body instead -- it won't error out.
+
+NOTE: this bypass is entirely a backend/server-side concern. The frontend
+does not need any changes to use it -- it still just uploads a video +
+height and fetches back whatever model.obj ends up at
+calibration_result["obj_path"], regardless of whether that calibration
+started from this bypass mesh, a real SAM 3D Body reconstruction, or a
+neutral default body.
 
 NOTE on scaling: jobs are tracked in an in-memory dict and run in a
 background thread within this single process. That's fine for local/dev
@@ -47,9 +64,10 @@ FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173")
 # point for --calibrate-mesh instead. This is a fixed operator-configured
 # fallback (e.g. a generic body mesh prepared once), not something an
 # end-user uploads per-scan -- see the input_3d_obj/input_identity bypass
-# block in main.py's Stage 4.
-INPUT_3D_OBJ_PATH = os.environ.get("INPUT_3D_OBJ_PATH") or None
-INPUT_IDENTITY_PATH = os.environ.get("INPUT_IDENTITY_PATH") or None
+# block in main.py's Stage 4. Defaults point at your prepared reference
+# mesh; override via env var if you move/rename it.
+INPUT_3D_OBJ_PATH = os.environ.get("INPUT_3D_OBJ_PATH", "./Ref_3D_exp/sam3d_body.obj")
+INPUT_IDENTITY_PATH = os.environ.get("INPUT_IDENTITY_PATH", "./Ref_3D_exp/fused_identity.npy")
 
 app = FastAPI(title="Virtual Fitting Room API")
 
@@ -76,6 +94,8 @@ def _run_job(job_id: str, video_path: Path, height_cm: float):
             user_height_cm=height_cm,
             calibrate_mesh_flag=True,
             mhr_assets=MHR_ASSETS_PATH,
+            input_3d_obj=INPUT_3D_OBJ_PATH,
+            input_identity=INPUT_IDENTITY_PATH,
         )
 
         if calibration_result is None or not os.path.exists(calibration_result["obj_path"]):

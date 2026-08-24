@@ -117,23 +117,73 @@ def neutral_model_parameters(mhr_model, batch_size=1, device=None):
               - NUM_IDENTITY_BLENDSHAPES - NUM_FACE_EXPRESSION_BLENDSHAPES)
     return torch.zeros(batch_size, n_pose, device=device)
 
-
-def make_forward_fn(mhr_model, device=None):
-    """Wraps mhr_model.forward into forward_fn(identity_1d) -> vertices (V,3),
-    fixing pose to neutral/rest and batch size to 1 -- the interface
-    calibrate_identity_to_measurements() expects. Kept separate from that
-    function so the optimizer can be tested against a synthetic stand-in
-    without needing the real model (see module docstring)."""
+def make_forward_fn(mhr_model, device=None, pose=None):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pose = neutral_model_parameters(mhr_model, batch_size=1, device=device)
+    if pose is None:
+        from mhr.mhr import NUM_FACE_EXPRESSION_BLENDSHAPES, NUM_IDENTITY_BLENDSHAPES
+        n_pose = mhr_model.character.parameter_transform.size - NUM_IDENTITY_BLENDSHAPES - NUM_FACE_EXPRESSION_BLENDSHAPES
+        pose = torch.zeros(1, n_pose, device=device)
+    elif pose.dim() == 1:
+        pose = pose.unsqueeze(0)
 
     def forward_fn(identity_1d):
-        identity_batched = identity_1d.unsqueeze(0)  # (1, 45)
-        vertices, _ = mhr_model.forward(identity_batched, pose, face_expr_coeffs=None)
-        return vertices[0]  # (V, 3)
+        identity_batched = identity_1d.unsqueeze(0)
+        
+        # Catch arbitrary number of return values
+        outputs = mhr_model.forward(identity_batched, pose, face_expr_coeffs=None)
+        
+        # PyMomentum can return ((vertices, normals), skel_state) or other nested tuples.
+        # This aggressively hunts down the first torch.Tensor (the vertices).
+        def _get_first_tensor(obj):
+            if isinstance(obj, torch.Tensor): 
+                return obj
+            if isinstance(obj, (tuple, list)) and len(obj) > 0: 
+                return _get_first_tensor(obj[0])
+            return None
+            
+        verts = _get_first_tensor(outputs)
+        
+        skel = None
+        if isinstance(outputs, (tuple, list)) and len(outputs) > 1:
+            skel = outputs[1]
+            
+        # Unbatch the vertices
+        return verts[0], skel
 
     return forward_fn
 
+
+def calibrate_and_export(asset_folder, target_measurements_cm, initial_identity=None,
+                         out_path="pipeline_output/body_3d_model.obj",
+                         height_fracs=None, iterations=100, lr=0.005, lod=1, device=None,
+                         reg_weight=1.0, clamp_range=0.25, initial_pose=None):
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    mhr_model = load_mhr_model(asset_folder=asset_folder, device=device, lod=lod)
+    faces = get_mesh_faces(mhr_model)
+    
+    pose_tensor = None
+    if initial_pose is not None:
+        pose_tensor = torch.as_tensor(np.asarray(initial_pose), dtype=torch.float32, device=device)
+    forward_fn = make_forward_fn(mhr_model, device=device, pose=pose_tensor)
+
+    init = None
+    if initial_identity is not None:
+        init = torch.as_tensor(np.asarray(initial_identity), dtype=torch.float32, device=device)
+
+    final_identity, history = calibrate_identity_to_measurements(
+        forward_fn, target_measurements_cm, height_fracs=height_fracs,
+        initial_identity=init, iterations=iterations, lr=lr, device=device,
+        reg_weight=reg_weight, clamp_range=clamp_range)
+
+    with torch.no_grad():
+        # THIS IS THE FIX: explicitly unpack the tuple before calling .cpu()
+        final_vertices, _ = forward_fn(final_identity)
+        final_vertices = final_vertices.cpu().numpy()
+
+    export_obj(final_vertices, faces, out_path)
+    print(f"Calibrated 3D mesh saved -> {out_path}")
+
+    return {"obj_path": out_path, "identity": final_identity.cpu().numpy(), "loss_history": history}
 
 # Default height fractions (0=feet, 1=head-top) for each circumference level,
 # based on standard adult figure-drawing proportions (an "8-heads-tall"
@@ -198,74 +248,88 @@ def ellipse_circumference(width, depth):
 # ---------------------------------------------------------------------------
 # Calibration loop
 # ---------------------------------------------------------------------------
-def calibrate_identity_to_measurements(forward_fn, target_measurements_cm,
-                                        height_fracs=None, num_identity=45,
-                                        initial_identity=None, iterations=300,
-                                        lr=0.05, device=None, verbose=True,
-                                        reg_weight=0.03, clamp_range=3.0):
-    """
-    forward_fn(identity_coeffs) -> vertices (V,3): a closure wrapping the
-        real MHR forward pass with pose/face params fixed to neutral, so
-        the optimizer only has to reason about the 45-dim identity vector.
-        (Kept as an injected function -- rather than calling mhr.MHR
-        directly in here -- so this loop can be tested against a synthetic
-        stand-in without the real model, and reused unchanged once wired
-        to the real one. Use make_forward_fn(mhr_model) to build this for
-        the real model.)
-    target_measurements_cm: the dict returned by
-        anthropometry.estimate_measurements() -- chest_bust/waist/hips/neck/
-        thigh (each {"circumference_cm": ...}) and shoulder_width_cm/
-        sleeve_length_cm/inseam_cm/torso_length_cm.
-    height_fracs: dict mapping each CIRCUMFERENCE_TARGETS key to a 0..1
-        height fraction (feet=0, head=1) on the MESH. Defaults to
-        DEFAULT_HEIGHT_FRACS (approximate, see its docstring) if omitted.
-    reg_weight: strength of an L2 penalty pulling identity back toward
-        zero (the neutral/average body) each step. WITHOUT this, gradient
-        descent can push identity params to extreme, out-of-distribution
-        values to force-match a target circumference -- MHR's blendshapes
-        are only well-behaved near the training distribution, so extreme
-        values produce anatomically nonsensical meshes (flared hips, twig
-        -thin limbs) even though the loss numerically improves. This is
-        exactly what caused the distorted mesh you saw earlier -- this
-        parameter is the fix, not just a tuning knob to leave at 0.
-    clamp_range: hard safety net on top of the soft regularization --
-        identity values are clamped to [-clamp_range, clamp_range] after
-        every step. Meta's own docs describe -3..+3 as identity's "typical
-        range", so this is a generous bound, not a tight one.
+# LENGTH_TARGETS processing removed temporarily until skel_state structure is verified.
 
-    Returns (final_identity, history) where history is a list of
-    per-iteration dicts: {"loss", "reg_loss", "identity_norm", "errors":
-    {key: {"predicted_cm", "target_cm", "pct_error"}}} -- useful for
-    verifying the fit actually converged sanely, not just that loss went down.
-    """
+def calibrate_identity_to_measurements(forward_fn, target_measurements_cm,
+                                       height_fracs=None, num_identity=45,
+                                       initial_identity=None, iterations=100,
+                                       lr=0.005, device=None, verbose=True,
+                                       reg_weight=1.0, clamp_range=0.25):
     if height_fracs is None:
         height_fracs = DEFAULT_HEIGHT_FRACS
 
     device = device or torch.device("cpu")
-    identity = (initial_identity.clone() if initial_identity is not None
-                else torch.zeros(num_identity, device=device))
-    identity.requires_grad_(True)
+    
+    if initial_identity is None:
+        initial_identity = torch.zeros(num_identity, device=device)
+    else:
+        initial_identity = initial_identity.clone().detach()
 
-    optimizer = torch.optim.Adam([identity], lr=lr)
+    # ---------------------------------------------------------
+    # DIAGNOSTIC TESTS: Identity & Skeleton Structure
+    # ---------------------------------------------------------
+    if verbose:
+        print("\n--- PRE-OPTIMIZATION DIAGNOSTICS ---")
+        with torch.no_grad():
+            v_initial, skel_initial = forward_fn(initial_identity)
+            v_zero_delta, _ = forward_fn(initial_identity + torch.zeros_like(initial_identity))
+            
+            print("identity reconstruction max difference (expect ~0):", 
+                  (v_initial - v_zero_delta).abs().max().item())
+            
+            print("\nChecking skel_state structure:")
+            print("type:", type(skel_initial))
+            if hasattr(skel_initial, "shape"):
+                print("shape:", skel_initial.shape)
+            
+            test_identity = initial_identity.clone()
+            test_identity[0] += 0.1
+            v_pert, _ = forward_fn(test_identity)
+            print("\nchange from +0.1 to identity[0] (mean vertex diff):",
+                  (v_pert - v_initial).abs().mean().item())
+        print("------------------------------------\n")
+
+    delta = torch.zeros_like(initial_identity, requires_grad=True, device=device)
+    optimizer = torch.optim.Adam([delta], lr=lr)
     history = []
 
     for step in range(iterations):
         optimizer.zero_grad()
-        vertices = forward_fn(identity)
+        
+        # Explicitly construct identity: ONLY modify body params [:20]
+        identity = initial_identity.clone()
+        identity[:20] = initial_identity[:20] + delta[:20]
+        identity[20:] = initial_identity[20:]
+        
+        vertices, skel_state = forward_fn(identity)
 
-        measurement_loss = torch.tensor(0.0, device=device)
+        # ---------------------------------------------------------
+        # DIAGNOSTIC TEST: Gradient Flow
+        # ---------------------------------------------------------
+        if step == 0 and verbose:
+            print("\n--- GRADIENT CHECK ---")
+            print("vertices.requires_grad:", vertices.requires_grad)
+            print("vertices.grad_fn:", vertices.grad_fn)
+            print("delta.requires_grad:", delta.requires_grad)
+            print("----------------------\n")
+
+        measurement_loss = torch.tensor(0.0, device=device, dtype=vertices.dtype)
         n_terms = 0
         step_errors = {}
 
+        # Evaluate Circumference Targets ONLY
         for key in CIRCUMFERENCE_TARGETS:
             target = target_measurements_cm.get(key)
             if not target or target.get("circumference_cm") is None or key not in height_fracs:
                 continue
+            
             width, depth = measure_width_depth(vertices, height_fracs[key])
             pred_circ = ellipse_circumference(width, depth)
-            target_circ = torch.tensor(float(target["circumference_cm"]), device=device)
-            measurement_loss = measurement_loss + ((pred_circ - target_circ) / target_circ) ** 2
+            target_circ = torch.tensor(float(target["circumference_cm"]), device=device, dtype=vertices.dtype)
+            
+            measurement_loss += ((pred_circ - target_circ) / target_circ) ** 2
             n_terms += 1
+            
             step_errors[key] = {
                 "predicted_cm": round(pred_circ.item(), 1),
                 "target_cm": round(target_circ.item(), 1),
@@ -273,39 +337,54 @@ def calibrate_identity_to_measurements(forward_fn, target_measurements_cm,
             }
 
         if n_terms == 0:
-            raise ValueError(
-                "No circumference targets matched height_fracs -- nothing to optimize. "
-                "Provide height_fracs for at least one of: " + ", ".join(CIRCUMFERENCE_TARGETS))
+            raise ValueError("No valid circumference targets found.")
 
-        reg_loss = reg_weight * (identity ** 2).mean()
+        # Penalize movement AWAY from SAM3D identity (applied ONLY to the moving body parts)
+        reg_loss = reg_weight * delta[:20].pow(2).mean()
         loss = measurement_loss + reg_loss
 
         loss.backward()
         optimizer.step()
 
         with torch.no_grad():
-            identity.clamp_(-clamp_range, clamp_range)
+            # Constrain delta and enforce immutability on head/hands
+            delta[:20].clamp_(-clamp_range, clamp_range)
+            delta[20:] = 0.0
 
         history.append({
             "loss": loss.item(),
             "measurement_loss": measurement_loss.item(),
             "reg_loss": reg_loss.item(),
-            "identity_norm": identity.norm().item(),
             "errors": step_errors,
         })
 
         if verbose and (step % max(1, iterations // 10) == 0 or step == iterations - 1):
-            print(f"  step {step:>4}/{iterations}  loss={loss.item():.6f}  "
-                  f"(measurement={measurement_loss.item():.6f}, reg={reg_loss.item():.6f})  "
-                  f"|identity|={identity.norm().item():.2f}")
+            print(
+                f"  step {step:>4}/{iterations} "
+                f"loss={loss.item():.6f} "
+                f"(measurement={measurement_loss.item():.6f}, "
+                f"reg={reg_loss.item():.6f}) "
+                f"max_delta={delta[:20].abs().max().item():.4f} "
+                f"mean_delta={delta[:20].abs().mean().item():.4f}"
+            )
+
+    final_identity = initial_identity.clone()
+    final_identity[:20] += delta[:20].detach()
+    final_identity[20:] = initial_identity[20:]
 
     if verbose:
         print("\nFinal per-measurement fit:")
         for key, err in history[-1]["errors"].items():
-            print(f"  {key:<12} predicted={err['predicted_cm']:>6}cm  "
-                  f"target={err['target_cm']:>6}cm  error={err['pct_error']:+.1f}%")
+            print(f"  {key:<18} predicted={err['predicted_cm']:>6.1f}cm  "
+                  f"target={err['target_cm']:>6.1f}cm  error={err['pct_error']:+.1f}%")
+                  
+        identity_delta = final_identity - initial_identity
+        print("\nIdentity change:")
+        print("  max:", identity_delta[:20].abs().max().item())
+        print("  mean:", identity_delta[:20].abs().mean().item())
+        print("  L2:", identity_delta[:20].norm().item())
 
-    return identity.detach(), history
+    return final_identity.detach(), history
 
 
 def export_obj(vertices, faces, out_path):
@@ -335,45 +414,3 @@ def export_obj(vertices, faces, out_path):
 # ---------------------------------------------------------------------------
 # Top-level orchestration
 # ---------------------------------------------------------------------------
-def calibrate_and_export(asset_folder, target_measurements_cm, initial_identity=None,
-                          out_path="pipeline_output/body_3d_model.obj",
-                          height_fracs=None, iterations=300, lr=0.05, lod=1, device=None,
-                          reg_weight=0.03, clamp_range=3.0):
-    """
-    One-call convenience wrapper: load MHR, calibrate identity to the given
-    measurements (optionally starting from body_3d.py's fused_identity),
-    forward once more at the final identity, and export the mesh.
-
-    initial_identity: numpy array or torch tensor (45,) from
-        body_3d.build_3d_model()'s "fused_identity" result -- gives the
-        optimizer a head start informed by your actual 4 photographed views,
-        rather than starting from a generic average body. Optional -- pass
-        None (the default) to run fully standalone, no body_3d.py needed.
-    reg_weight, clamp_range: passed straight through to
-        calibrate_identity_to_measurements() -- see its docstring. If the
-        exported mesh still looks distorted, RAISE reg_weight (fewer
-        distortions, looser measurement fit); if it looks too generic/
-        doesn't match your measurements closely enough, LOWER it.
-
-    Returns {"obj_path", "identity", "loss_history"}.
-    """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    mhr_model = load_mhr_model(asset_folder=asset_folder, device=device, lod=lod)
-    faces = get_mesh_faces(mhr_model)
-    forward_fn = make_forward_fn(mhr_model, device=device)
-
-    init = None
-    if initial_identity is not None:
-        init = torch.as_tensor(np.asarray(initial_identity), dtype=torch.float32, device=device)
-
-    final_identity, history = calibrate_identity_to_measurements(
-        forward_fn, target_measurements_cm, height_fracs=height_fracs,
-        initial_identity=init, iterations=iterations, lr=lr, device=device)
-
-    with torch.no_grad():
-        final_vertices = forward_fn(final_identity).cpu().numpy()
-
-    export_obj(final_vertices, faces, out_path)
-    print(f"Calibrated 3D mesh saved -> {out_path}")
-
-    return {"obj_path": out_path, "identity": final_identity.cpu().numpy(), "loss_history": history}
